@@ -1,0 +1,218 @@
+PEP: 700
+Title: Customizable assignment operator
+Version: $Revision$
+Last-Modified: $Date$
+Author: Yanghao Hua <huayanghao@gmail.com>
+Status: ...
+Type: Standards Track
+Content-Type: text/x-rst
+Created: 05-Jun-2019
+Python-Version: ...
+Post-History: 05-Jun-2019
+
+Abstract
+========
+
+This PEP proposes a new assignment operator "<==" that delegates the assignment
+behavior of an existing object to its user defined types.
+
+Specification
+=============
+
+A new binary operator is added to the Python language:
+
+=======  ========================= ===============================
+ Op      Precedence/associativity     Methods
+=======  ========================= ===============================
+``<==``   n/a    (TBD...)           ``__lassign__``
+=======  ========================= ===============================
+
+No implementations of these methods are added to the builtin or
+standard library types.
+
+Motivation
+==========
+
+Executive summary
+-----------------
+
+Python assignment operator (=, :=) is probably the only operators that cannot be
+customized/overloaded by user defined types. Operators like +,-,<< etc. all have
+its corresponding builtin special method (e.g. __add__) that users can customize
+the behavior of new types, and allow those new types to even inter-operate with
+python builtin types (e.g. obj + 2).
+
+Due to python's dynamic nature, whenver the
+normal assignment operator is used, it is assumed that a new object is created
+and subsequently bond to the left hand side variable (e.g. x = y + 1). 
+And this motivated
+features like descriptors to provide a mechanism to overload the assignment
+operators. However descriptor has many special conditions developers need to
+take care, and actually it is so special that it only works when descriptor is
+declared as a class attribute, which makes it difficult (though still possible
+through redefing __get/setattr__()) to have objects each with a different set of
+descriptors, consider:
+
+    class Act:
+        def __set__(self, obj, v): ...
+        def __get__(self, obj): ...
+
+    class UseAct:
+        a0 = Act()
+        a1 = Act()
+        ...
+        def __init__(self, ...): ...
+
+This is how usually descriptors works. If you ever wanted to customize a
+different set of descriptors for each object, you might imagine to write
+something like this:
+
+    class UseActNotWorking:
+        def __init__(self, ...):
+            self.a0 = Act()
+            self.a1 = Act()
+            self.b0 = Act()
+            ...
+
+Objects from UseActNotWorking will never trigger descriptor protocol. You might
+think you can fix this with:
+
+    class UseActNotWorkingFixed:
+        def __init__(self, more=False): 
+            setattr(self.__class__, "a0", Act())
+            setattr(self.__class__, "a1", Act())
+            if more:
+                setattr(self.__class__, "b0", Act())
+
+    t0 = UseActNotWorkingFixed(more=True)
+    t0.b0 # This works!
+    t1 = UseActNotWorkingFixed(more=False)
+    t1.b0 # what? I don't want "b0" for t1, but it actually exists!
+
+And of course you won't be able to use descriptor like this if you ever dare
+thinking about it:
+
+    a0 = Act()
+    a0 = 3 # ... oops, and yes, you get a 3 instead.
+
+The problem is that there is only one class definition, any setattr() done in
+t0.__init__() is also impacting all subsequent instances. Eventually developers
+write meta classes and overrides __get/setattr__() to "fix" the descriptor
+behavior and allow class UseActNotWorking working as one would expected.
+
+Jeroen Demeyer on Python-Ideas showed another case which is actually having a
+contradicting mental model for list copy and assignment, consider:
+
+    X = [1,2,3,4]
+    Y = X[:] # --> here it means a copy
+    X[:] = [5,6,7,8] # --> here it means the opposite: in place assignment
+    # X[:] in the second case does not create a copy of X[:]
+    # This is a clear mental model break down!
+
+In Domain Specific Language design, this poses similar problem. Specifically in
+hardware description language design, there is a strong need to override
+assignment operation. Consider below Verilog non-blocking assignment (an
+assignment that does not take place immediately but need to be delayed a little
+bit):
+
+    signal <= 3 /* verilog */
+
+Here, signal value does not change immediately. MyHDL is a widely used HDL
+designed in Python and it works this around by doing this:
+
+    signal.next <= 3 /* MyHDL */
+
+And others proposed to do it just with a function call:
+
+    signal.assign(3) /* Other Possibility */
+
+The problem of the latter two types of syntax is, ".next" and ".assign" is
+chosen arbitrarily. And it is exposed to end user. It is also not as
+readable as the first verilog example, which is a long established concept going
+back as early as 1983. Now suppose you have two projects, A chose to use the
+signal.next syntax, and B chose to use the signal.assign() syntax, and tons of
+application already developed on both A and B, and it turns out that A and B can
+actually interoperate to benefit each other, the whole ecosystem of either A or
+B has to completely re-write their code using the other arbitrarily chose
+syntax.
+
+All these issue can be solved with a single operator: "<==", the left
+assignment, or in-place assignment if you will.
+
+Descriptor made simple:
+
+    class Act:
+        def __lassign__(self, other): ...
+
+    class UseActWorks:
+        def __init__(self, more):
+            self.a0 = Act()
+            self.a1 = Act()
+            if more:
+                self.b0 = Act()
+    
+    t0 = UseActWorks(True)
+    t.a0 <== 3 # works
+    t.b0 <== 4 # works
+    t1 = UseActWorks(False)
+    t1.b0 <== 5 # Exception raised, t.b0 is not defined, does not work.
+    # t1.b0 is NOT expecting b0 to be defined.
+
+    # And even more:
+    x = Act()
+    x <== 6 # works like a charm!
+    # No meta class, no overrides of __set/getattr__() magic methods,
+    # it just works!
+
+List copy and in-place assign:
+
+    x = L[:] # L[:] means a not-so-deep, but a copy of L
+    L[:] = y # this should be disabled ... or discouraged
+    L <== y  # this should be encouraged ... mentally consistent!
+
+And now Python HDL looks and feels like real HDL:
+
+    signal <== 5 # just like verilog
+
+And more, you can do pipe-lined signal processing:
+
+    fft = FFT()
+    lowpass = LowPass(freq=...)
+    highpass = HighPass(freq=...)
+    ifft = IFFT()
+    # and chaining them together is like drawing a picture:
+    final_result = (ifft <== highpass <== lowpass <== fft).run(IQ_Samples)
+    # It really looks pretty
+    # and look again the traditional way:
+    final_result = (ifft.connect(highpass).connect(lowpass).connect(fft)).run(IQ..)
+    # who really is connecting who ... not easy to read.
+
+Why not just use <<= or @= ?
+----------------------------
+
+All numeric operations (including the matrix operations) is having a well
+defined meaning, and the user defined type in question can operate like a
+python-builtin type (e.g. int), redefining <<= or @= to completely different
+meaning confuses users when those operation are mixed up:
+
+    x <<= 3 # shift 3 bit
+    y <<= 4 # in-place assignment? confuses user.
+
+Assignment operation is very different and it deserves its own operator such
+that a common concept is accepted by all users, which is the fundation of
+readability, where you don't change an existing well established operator to
+mean something completely different. When users see <<, they expect a shift
+operation (or something conceptually very very similar). This is like English
+word "happy" means happy in all English-speaking countries. The counter example
+is shaking-heads/nodding-heads does not necessarily mean the same thing and we
+all know how much trouble/mis-understanding it has caused.
+
+Why not use MacroPy?
+--------------------
+To be updated.
+
+How is this done in other programming languages?
+------------------------------------------------
+Scala and Chisel example.
+
+EOF.
